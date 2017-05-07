@@ -41,6 +41,7 @@ I2C_OFF	= 26	; XL
 .equiv I2C_VER	, 0xf1
 .equiv I2C_KEYS	, 0xf2
 .equiv I2C_EE_WP, 0xf3
+.equiv I2C_WDT,   0xf4
 .equiv I2C_ID	, 's'
 .equiv VERSION	, 0
 
@@ -74,21 +75,87 @@ ldone\reg:
 	CLOCK_OUT
 .endm
 
+.macro DATA_OUT_0
+	CBI	_SFR_IO_ADDR(PORTC), LED_SDI
+	CLOCK_OUT
+.endm
+
+.macro DATA_OUT_1
+	SBI	_SFR_IO_ADDR(PORTC), LED_SDI
+	CLOCK_OUT
+.endm
+
+.macro SET_CONFIG
+	DATA_OUT_0 ;1
+	DATA_OUT_0 ;2
+	DATA_OUT_0 ;3
+	DATA_OUT_0 ;4
+	DATA_OUT_0 ;5
+	DATA_OUT_0 ;6
+	DATA_OUT_0 ;7
+	DATA_OUT_0 ;8
+	DATA_OUT_0 ;9
+	DATA_OUT_0 ;10
+	DATA_OUT_0 ;11
+	DATA_OUT_0 ;12
+	DATA_OUT_0 ;13
+	DATA_OUT_0 ;14
+	DATA_OUT_0 ;15
+	DATA_OUT_0 ;16
+	DATA_OUT_0 ;17
+	DATA_OUT_1 ;18 (CFG-6) AutoOFF
+	DATA_OUT_0 ;19
+	DATA_OUT_0 ;20
+	SBI	_SFR_IO_ADDR(PORTC), LED_LE
+	DATA_OUT_0 ;21
+	DATA_OUT_0 ;22
+	DATA_OUT_0 ;23
+	DATA_OUT_0 ;24
+	CBI	_SFR_IO_ADDR(PORTC), LED_LE
+.endm
+
 .global draw_loop
 .global delay
 .global read_data
 .global write_data
 .global TWI_vect
+.global WDT_vect
 
 .extern pixels
 .extern id
 .extern key
 .extern i2c_reg
+.extern wdt_reg
+.extern flash
+.extern update_wdt
+.extern i2c_in_progress
 
 .section .text
 .func draw_loop
 draw_loop:
+SET_CONFIG ; Only to be used on entry
 Lframe_loop:
+; while i2c transaction in progress, just wait
+i2c_wait:
+	LDS 	PARAM,	i2c_in_progress
+	CPI 	PARAM, 	1
+	BREQ 	i2c_wait
+; update_wdt if needed
+	lds 	PARAM, 	update_wdt
+ 	CPI 	PARAM, 	0
+	BREQ 	sleep_loop
+	rcall 	WDT_config
+	CLR 	PARAM
+	STS 	update_wdt, PARAM
+sleep_loop:
+	SLEEP
+check_flash:
+	LDS PARAM,	flash
+	CPI PARAM,	0
+	BREQ Lframe_loop
+	CLR PARAM
+	STS flash,	PARAM ; flash = 0
+
 	CBI	_SFR_IO_ADDR(PORTC), FRAME_INT
 	LDI	YL, lo8(pixels)
 	LDI	YH, hi8(pixels)
@@ -178,6 +245,30 @@ lframeend:
 	OUT	_SFR_IO_ADDR(PORTD), PARAM
 	CBI	_SFR_IO_ADDR(PORTB), LED_OE_N	; /Scan
 	RJMP	Lframe_loop
+	RET
+.endfunc
+
+.func WDT_config
+WDT_config:
+; Turn off global interrupt
+	CLI
+	PUSH	r16
+; Reset Watchdog Timer
+	WDR
+; Clear WDRF in MCUSR
+	IN	r16,	_SFR_IO_ADDR(MCUSR)
+	ANDI	r16,	(0xff & (0<<WDRF))
+	OUT	_SFR_IO_ADDR(MCUSR),	r16
+; Write logical one to WDCE and WDE
+; Keep old prescaler setting to prevent unintentional time-out
+	LDS	r16,	WDTCSR
+	ORI	r16,	(1<<WDCE) | (1<<WDE)
+	STS	WDTCSR,	r16
+	LDS	r16,	wdt_reg
+	STS	WDTCSR,	r16
+	POP	r16
+; Turn on global interrupt
+	SEI
 	RET
 .endfunc
 
@@ -296,6 +387,8 @@ TWI_vect:
 	PUSH	YH
 	PUSH	I2C_OFF
 	IN	PWM, _SFR_IO_ADDR(SREG)
+  LDI PARAM, 1
+  STS i2c_in_progress, PARAM
 	LDS	PARAM, TWSR
 	ANDI	PARAM, 0xF8
 	LDS	I2C_OFF, i2c_reg
@@ -309,6 +402,8 @@ TWI_vect:
 	BREQ	ltsend
 	CPI	PARAM, TW_ST_DATA_NACK
 	BREQ	ltdnack
+	CPI 	PARAM, TW_SR_STOP       ; Stop contition has been issued
+	BREQ	lrstop
 	LDI	PARAM,  (1<<TWEA) | (1<<TWEN) | (1<<TWIE) | (1<<TWINT) ;ELSE
 	RJMP	ldone
 lreceive:
@@ -317,14 +412,15 @@ lreceive:
 	BRLO	lrspixel
 	CPI	I2C_OFF, 0xff			; if address==0xff
 	BREQ	lrsreg
-	CPI	I2C_OFF, I2C_EE_WP
-	BREQ	lree
+	CPI	I2C_OFF, I2C_WDT
+	BREQ	lrwdt
 	; NACK here
 	RJMP	lrdone				; else...
-lree:
-	SBI	_SFR_IO_ADDR(PORTB), EE_WP
-	CPSE	PARAM, 0
-	CBI	_SFR_IO_ADDR(PORTB), EE_WP
+lrwdt:
+	STS	wdt_reg, PARAM
+	LDI	PARAM,	1
+	STS	update_wdt, PARAM
+	STS	flash, PARAM
 	RJMP	lrdone
 lrsreg:
 	STS	i2c_reg, PARAM			; address = DATA
@@ -338,6 +434,10 @@ lrspixel:
 	CLR	I2C_OFF
 	ADC	YH, I2C_OFF
 	ST	Y, PARAM
+  RJMP lrdone
+lrstop:
+	LDI	PARAM, 0
+	STS	i2c_in_progress, PARAM
 lrdone:
 	LDI	PARAM,  (1<<TWEA) | (1<<TWEN) | (1<<TWIE) | (1<<TWINT)
 ldone:
@@ -402,4 +502,15 @@ ltspixel:
 ltdone:
 	LDI	PARAM,  (1<<TWEA) | (1<<TWEN) | (1<<TWIE) | (1<<TWINT)
 	RJMP	ldone
+.endfunc
+
+.func WDT_vect
+WDT_vect:
+        ; We don't really need the interrupt
+        ; Just return from it
+        PUSH r16
+        LDI r16, 1
+        STS flash, r16
+        POP r16
+        RETI
 .endfunc
